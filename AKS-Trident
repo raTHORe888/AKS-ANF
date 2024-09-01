@@ -1,0 +1,119 @@
+RESOURCE_GROUP=aks-azure-netapp-rg #Env var for the RG
+
+az group create -l eastus -n $RESOURCE_GROUP #Create RG
+
+az provider register --namespace Microsoft.NetApp --wait #Register Microsoft.NetApp Resource Provider
+
+az provider show --namespace Microsoft.NetApp --query registrationState #Check the registration state
+
+VNET_NAME=aks-azure-netapp-vnet #Env var for the VNET
+
+AKS_SUBNET_NAME=aks-subnet #Env var for AKS subnet
+
+az network vnet create --resource-group $RESOURCE_GROUP -n $VNET_NAME --address-prefix 10.224.0.0/12 --subnet-name $AKS_SUBNET_NAME --subnet-prefixes 10.224.0.0/16 #Create VNET including the AKS subnet
+
+AKS_SUBNET_ID=$(az network vnet subnet show -g $RESOURCE_GROUP --vnet-name $VNET_NAME --name $AKS_SUBNET_NAME --query id -o tsv) #Query AKS subnet ID for upcoming creation of AKS within that subnet
+
+az aks create --resource-group $RESOURCE_GROUP -n aks-netapp -c 2 -k 1.26.3 --vnet-subnet-id $AKS_SUBNET_ID #Create the AKS cluster
+
+az netappfiles account create --resource-group $RESOURCE_GROUP --location eastus --account-name anf-account #Create the ANF account
+
+az netappfiles pool create --resource-group $RESOURCE_GROUP --location eastus --account-name anf-account --pool-name anf-pool --size 2 --service-level Premium #Create the ANF pool
+
+ANF_SUBNET_NAME=azure-netapp-subnet #Env var for the ANF subnet
+
+az network vnet subnet create --resource-group $RESOURCE_GROUP --vnet-name $VNET_NAME --name $ANF_SUBNET_NAME --delegations "Microsoft.NetApp/volumes" --address-prefixes 10.225.0.0/24 #Create ANF subnet within the VNET created before
+
+az aks get-credentials --resource-group $RESOURCE_GROUP -n aks-netapp #Get the credentials for the AKS cluster
+
+kubectl create ns trident #Create trident namespace
+
+kubectl apply -f https://raw.githubusercontent.com/NetApp/trident/v23.01.1/deploy/bundle_post_1_25.yaml -n trident #Create Trident related K8s objects for AKS cluster with K8s version > 1.25
+
+kubectl apply -f https://raw.githubusercontent.com/NetApp/trident/v23.01.1/deploy/crds/tridentorchestrator_cr.yaml #Create TridentOrchestrator
+
+kubectl describe torc trident #Check the installation state of the TridentOrchestrator
+
+az ad sp create-for-rbac --name https://microsoft.onmicrosoft.com/anf --role Contributor --scopes /subscriptions/c1e88e2e-f469-4d8e-aaab-c7422285cb36/resourcegroups/$RESOURCE_GROUP #Create app registrator with Contributor role over the aks-azure-netapp-rg RG
+
+vim backend-anf.yaml #Fill the needed values for the K8s secret and the TridentBackendConfig
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: backend-tbc-anf-secret
+type: Opaque
+stringData:
+  clientID: abcde356-bf8e-fake-c111-abcde35613aa
+  clientSecret: rR0rUmWXfNioN1KhtHisiSAnoTherboGuskey6pU
+---
+apiVersion: trident.netapp.io/v1
+kind: TridentBackendConfig
+metadata:
+  name: backend-tbc-anf
+spec:
+  version: 1
+  storageDriverName: azure-netapp-files
+  subscriptionID: 12abc678-4774-fake-a1b2-a7abcde39312
+  tenantID: a7abcde3-edc1-fake-b111-a7abcde356cf
+  location: eastus
+  serviceLevel: Premium
+  credentials:
+    name: backend-tbc-anf-secret
+
+kubectl apply -f backend-anf.yaml -n trident #Create the K8s secret and the TridentBackendConfig in trident namespace
+
+kubectl describe tridentbackendconfig.trident.netapp.io/backend-tbc-anf -n trident #Describe the TridentBackendConfig to check
+
+kubectl get crd #Just a quick look at the deployed CRDs
+
+kubectl get tridentbackend -n trident #Confirm the TridentBackend exists
+
+#Create further the SC, PVC, pod
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: azure-netapp-files
+provisioner: csi.trident.netapp.io
+parameters:
+  backendType: azure-netapp-files
+  fsType: nfs
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: anf-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: azure-netapp-files
+  
+kind: Pod
+apiVersion: v1
+metadata:
+  name: pod-anf
+spec:
+  containers:
+  - name: nginx
+    image: nginx
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+    volumeMounts:
+    - mountPath: "/mnt/data"
+      name: volume
+  volumes:
+    - name: volume
+      persistentVolumeClaim:
+        claimName: anf-pvc
